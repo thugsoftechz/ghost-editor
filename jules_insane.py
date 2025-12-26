@@ -23,17 +23,24 @@ import time
 import json
 import random
 import re
+import math
+from typing import List, Tuple, Optional, Dict
+
 import numpy as np
 import streamlit as st
 import cv2
+import librosa
+import soundfile as sf
+import pyloudnorm as pyln
 
-# --- Robust Imports ---
+# --- 1. Robust Imports & Compatibility ---
 
 try:
     from moviepy.editor import (
         VideoFileClip, AudioFileClip, TextClip, CompositeVideoClip,
         CompositeAudioClip, concatenate_videoclips, vfx, afx, ImageClip
     )
+    from moviepy.audio.AudioClip import AudioArrayClip
     import moviepy.audio.fx.all as audio_fx
     MOVIEPY_V1 = True
 except ImportError:
@@ -42,6 +49,7 @@ except ImportError:
         VideoFileClip, AudioFileClip, TextClip, CompositeVideoClip,
         CompositeAudioClip, concatenate_videoclips, ImageClip
     )
+    from moviepy.audio.AudioClip import AudioArrayClip
     import moviepy.video.fx as vfx
     import moviepy.audio.fx as afx
     MOVIEPY_V1 = False
@@ -59,399 +67,558 @@ except ImportError:
     WHISPER_AVAILABLE = False
 
 try:
-    import pyloudnorm as pyln
-    import librosa
-    import soundfile as sf
-    AUDIO_DSP_AVAILABLE = True
-except ImportError:
-    AUDIO_DSP_AVAILABLE = False
-
-try:
     import openai
     OPENAI_AVAILABLE = True
 except ImportError:
     OPENAI_AVAILABLE = False
 
-# --- Modules ---
+
+# --- 2. Viral Brain (Content Intelligence) ---
 
 class ViralBrain:
-    """Module 1: LLM-driven Content Intelligence"""
-    def __init__(self, api_key=None):
+    def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key
-        if api_key and OPENAI_AVAILABLE:
-            openai.api_key = api_key
-
-    def transcribe_full(self, audio_path):
-        if not WHISPER_AVAILABLE:
-            return None
-        st.write("🧠 ViralBrain: Running Faster-Whisper (Full Scan)...")
-        # 'base' model for speed/quality balance
-        model = WhisperModel("base", device="cpu", compute_type="int8")
-        segments, info = model.transcribe(audio_path, word_timestamps=True)
-        return list(segments)
-
-    def analyze_viral_moments(self, segments, aggressive_factor=0.5):
-        """
-        Send transcript to LLM to find viral hooks.
-        Fallback to heuristic cutting if LLM fails.
-        """
-        full_text = " ".join([s.text for s in segments])
-
-        prompt = (
-            f"Analyze the transcript. Identify the 3 most viral, funny, or insightful 60-second segments. "
-            f"Return ONLY a JSON list of objects with keys 'start_time' and 'end_time' (in seconds). "
-            f"Transcript: {full_text[:4000]}..."
-        )
-
-        viral_ranges = []
-        llm_success = False
-
         if self.api_key and OPENAI_AVAILABLE:
+            openai.api_key = self.api_key
+
+        self.whisper_model = None
+
+    def _load_whisper(self):
+        if not self.whisper_model and WHISPER_AVAILABLE:
+            self.whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+
+    def transcribe(self, audio_path: str) -> List[dict]:
+        if not WHISPER_AVAILABLE:
+            return []
+
+        self._load_whisper()
+        st.write("🧠 ViralBrain: Transcribing Audio...")
+        segments, _ = self.whisper_model.transcribe(audio_path, word_timestamps=True)
+
+        results = []
+        for s in segments:
+            seg_data = {
+                "start": s.start,
+                "end": s.end,
+                "text": s.text,
+                "words": []
+            }
+            if s.words:
+                for w in s.words:
+                    seg_data["words"].append({
+                        "word": w.word,
+                        "start": w.start,
+                        "end": w.end,
+                        "probability": w.probability
+                    })
+            results.append(seg_data)
+        return results
+
+    def analyze_virality(self, segments: List[dict], audio_path: str, duration: float) -> List[Tuple[float, float]]:
+        """
+        Identifies segments.
+        Primary: LLM Selection.
+        Fallback: Librosa Silence Removal (DSP).
+        """
+        # LLM Logic
+        if self.api_key and OPENAI_AVAILABLE and segments:
             try:
-                st.write("🧠 ViralBrain: Consulting LLM Oracle...")
+                full_text = " ".join([s["text"] for s in segments])
+                prompt = (
+                    "Analyze this transcript. Identify the top 3 most viral, funny, or intense "
+                    "segments (approx 30-60s each). Return JSON: list of objects with 'start' and 'end' seconds. "
+                    f"Transcript: {full_text[:8000]}"
+                )
+
                 response = openai.chat.completions.create(
                     model="gpt-3.5-turbo",
                     messages=[
-                        {"role": "system", "content": "You are a viral video editor. Respond only in JSON."},
+                        {"role": "system", "content": "You are a viral video editor. Return strictly JSON."},
                         {"role": "user", "content": prompt}
                     ],
-                    max_tokens=300
+                    max_tokens=200
                 )
                 content = response.choices[0].message.content
-
-                # Simple parsing logic
-                # Look for patterns like {"start_time": 10, "end_time": 70}
-                matches = re.findall(r'"start_time":\s*([\d.]+),\s*"end_time":\s*([\d.]+)', content)
+                matches = re.findall(r'"start":\s*([\d.]+),\s*"end":\s*([\d.]+)', content)
                 if matches:
-                    for start, end in matches:
-                        viral_ranges.append((float(start), float(end)))
-                    llm_success = True
+                    return [(float(s), float(e)) for s, e in matches]
 
             except Exception as e:
-                st.warning(f"ViralBrain LLM disconnected ({str(e)}). Engaging Heuristic Mode.")
+                st.warning(f"ViralBrain LLM Error: {e}. Switching to DSP Fallback.")
 
-        if not llm_success:
-            # Heuristic Fallback
-            duration = segments[-1].end
-            count = 3
-            clip_len = 60 * (1.1 - aggressive_factor) # Adjust length based on factor
+        # Fallback: Librosa Silence Removal
+        st.write("🧠 ViralBrain: Running DSP Silence Removal (Fallback)...")
+        try:
+            # Load audio
+            y, sr = librosa.load(audio_path, sr=None)
+            # Split silence
+            # top_db=40 (threshold -40dB)
+            non_silent = librosa.effects.split(y, top_db=40)
 
-            for _ in range(count):
-                start = random.uniform(0, max(0, duration - clip_len))
-                end = min(duration, start + clip_len)
-                viral_ranges.append((start, end))
+            cuts = []
+            for start_sample, end_sample in non_silent:
+                start_t = start_sample / sr
+                end_t = end_sample / sr
 
-        return viral_ranges
+                # Buffer 0.2s
+                start_t = max(0, start_t - 0.2)
+                end_t = min(duration, end_t + 0.2)
+
+                # Minimum duration filter (e.g. 1s) to avoid jitter
+                if end_t - start_t > 1.0:
+                    cuts.append((start_t, end_t))
+
+            if not cuts:
+                return [(0, duration)]
+
+            return cuts
+
+        except Exception as e:
+            st.warning(f"DSP Error: {e}. Returning original.")
+            return [(0, duration)]
+
+
+# --- 3. Visual Retention Engine (Vision) ---
 
 class RetentionEngine:
-    """Module 2: Dynamic Zooming & Attention"""
     def __init__(self):
         self.mp_face = None
         if MEDIAPIPE_AVAILABLE:
             self.mp_face = mp.solutions.face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
 
-    def apply_punch_in(self, clip, mode="Gen-Z"):
-        """Randomly scales clip 100% or 115%."""
-        if mode != "Gen-Z":
-            return clip
+    def _get_face_trajectory(self, clip, sample_rate=5):
+        if not MEDIAPIPE_AVAILABLE:
+            return None
 
-        scale = random.choice([1.0, 1.15])
-        if scale == 1.0:
-            return clip
+        st.write("👀 RetentionEngine: Tracking Faces...")
+        w, h = clip.size
+        x_centers = []
+
+        # Use cv2 for explicit resizing (optimization)
+        new_h = 240
+        new_w = int(w * (new_h / h))
+
+        last_x = 0.5
+        for i, frame in enumerate(clip.iter_frames()):
+            if i % sample_rate != 0:
+                x_centers.append(last_x)
+                continue
+
+            # Use CV2 to resize for speed, then pass to mediapipe
+            small_frame = cv2.resize(frame, (new_w, new_h))
+
+            results = self.mp_face.process(small_frame)
+            if results.detections:
+                bbox = results.detections[0].location_data.relative_bounding_box
+                center_x = bbox.xmin + bbox.width / 2
+                last_x = center_x
+
+            x_centers.append(last_x)
+
+        fps = clip.fps if clip.fps else 24
+        window = int(fps * 2)
+        if window < 1: window = 1
+        smoothed = np.convolve(x_centers, np.ones(window)/window, mode='same')
+
+        return smoothed
+
+    def smart_crop_9_16(self, clip):
+        w, h = clip.size
+        target_aspect = 9/16
+        new_w = h * target_aspect
+
+        trajectory = self._get_face_trajectory(clip)
+
+        if trajectory is None:
+            x1 = w/2 - new_w/2
+            if MOVIEPY_V1:
+                return clip.crop(x1=x1, width=new_w, height=h)
+            else:
+                return clip.with_effects([vfx.Crop(x1=x1, width=new_w, height=h)])
+
+        def crop_func(t):
+            fps = clip.fps if clip.fps else 24
+            idx = int(t * fps)
+            if idx >= len(trajectory):
+                idx = len(trajectory) - 1
+
+            center_norm = trajectory[idx]
+            center_x = center_norm * w
+            x1 = center_x - new_w / 2
+            x1 = max(0, min(x1, w - new_w))
+            return x1, 0, x1 + new_w, h
+
+        if MOVIEPY_V1:
+            return clip.crop(x1=lambda t: crop_func(t)[0], width=new_w, height=h)
+        else:
+            try:
+                return clip.with_effects([vfx.Crop(x1=lambda t: crop_func(t)[0], width=new_w, height=h)])
+            except:
+                 x1 = w/2 - new_w/2
+                 return clip.with_effects([vfx.Crop(x1=x1, width=new_w, height=h)])
+
+    def apply_punch_ins(self, clip):
+        scale = random.choice([1.0, 1.1])
+        if scale == 1.0: return clip
 
         if MOVIEPY_V1:
             return clip.resize(scale)
         else:
             return clip.with_effects([vfx.Resize(scale)])
 
-    def apply_ken_burns(self, clip):
-        """Slow zoom towards face (1.0 -> 1.1)."""
-        if not MEDIAPIPE_AVAILABLE:
-            # Fallback linear center zoom
-            def zoom_func(t):
-                return 1.0 + 0.1 * (t / clip.duration)
-            if MOVIEPY_V1:
-                return clip.resize(zoom_func)
-            else:
-                return clip.with_effects([vfx.Resize(zoom_func)])
-
-        # Analyze first frame to find face center
-        w, h = clip.size
-        center_x, center_y = w/2, h/2
-
-        try:
-            # Get first frame
-            if MOVIEPY_V1:
-                frame = clip.get_frame(0)
-            else:
-                frame = clip.get_frame(0) # v2 might change, usually same
-
-            results = self.mp_face.process(frame)
-            if results.detections:
-                bbox = results.detections[0].location_data.relative_bounding_box
-                center_x = (bbox.xmin + bbox.width/2) * w
-                center_y = (bbox.ymin + bbox.height/2) * h
-        except:
-            pass
-
-        # Ken Burns: Zoom towards (center_x, center_y)
-        # We need a scroll/crop function.
-        # Simple implementation: Crop getting smaller around target point, then resize to original.
-
-        def crop_zoom(get_frame, t):
-            # Scale goes 1.0 -> 1.1
-            scale = 1.0 + 0.1 * (t / clip.duration)
-            # New Width/Height
-            new_w = w / scale
-            new_h = h / scale
-
-            # Center of crop shifts towards target
-            # t=0: center at w/2, h/2. t=end: center approaches target?
-            # Standard Ken Burns: Center stays fixed on target?
-            # Or we interpolate center from image center to face center?
-            # Let's keep center on face.
-
-            x1 = center_x - new_w / 2
-            y1 = center_y - new_h / 2
-
-            # Clamp
-            x1 = max(0, min(x1, w - new_w))
-            y1 = max(0, min(y1, h - new_h))
-
-            img = get_frame(t)
-            # Crop
-            # numpy slicing: [y:y+h, x:x+w]
-            cropped = img[int(y1):int(y1+new_h), int(x1):int(x1+new_w)]
-
-            # Resize back to w, h
-            return cv2.resize(cropped, (w, h))
+    def apply_dynamic_zoom(self, clip):
+        """Ken Burns Effect: 1.0x -> 1.15x over clip duration."""
+        def zoom(t):
+            return 1.0 + 0.15 * (t / clip.duration)
 
         if MOVIEPY_V1:
-            return clip.fl(crop_zoom)
+            return clip.resize(zoom)
         else:
-            # v2 fl is usually fl(func, apply_to=[])
-            return clip.fl(crop_zoom)
+            return clip.with_effects([vfx.Resize(zoom)])
 
-class ContentAugmentor:
-    """Module 3 & 4: B-Roll & Karaoke"""
-    def __init__(self, assets_dir="assets"):
-        self.assets_dir = assets_dir
-        os.makedirs(assets_dir, exist_ok=True)
 
-    def inject_b_roll(self, clip, segments, offset):
-        """Overlay B-Roll based on keywords. offset is start time of subclip in original video."""
-        # Flat list of words
-        words = []
-        for s in segments:
-            if hasattr(s, 'words'):
-                words.extend(s.words)
-
-        final_clip = clip
-
-        # Scan words
-        for word in words:
-            # Word absolute start
-            abs_start = word.start
-            # Relative start in subclip
-            rel_start = abs_start - offset
-
-            # Check if word is inside this clip
-            if rel_start < 0 or rel_start > clip.duration:
-                continue
-
-            term = word.word.strip().lower().strip(".,!?")
-            asset_path = os.path.join(self.assets_dir, f"{term}.mp4")
-
-            if os.path.exists(asset_path):
-                try:
-                    b_roll = VideoFileClip(asset_path).resize(height=clip.h)
-                    # Duration: until end of word + 1s buffer
-                    dur = (word.end - word.start) + 1.5
-                    if rel_start + dur > clip.duration:
-                        dur = clip.duration - rel_start
-
-                    b_roll = b_roll.set_position("center").set_start(rel_start).set_duration(dur)
-                    final_clip = CompositeVideoClip([final_clip, b_roll])
-                except:
-                    pass
-
-        return final_clip
-
-    def generate_karaoke_subs(self, clip, segments, offset):
-        """Generates Highlighted TextClips."""
-        if not segments: return clip
-
-        text_clips = []
-        w, h = clip.size
-        fontsize = 50
-        font = "Impact" if os.name == 'nt' else "DejaVu-Sans-Bold"
-
-        all_words = []
-        for s in segments:
-            if hasattr(s, 'words'):
-                all_words.extend(s.words)
-
-        for i, word_obj in enumerate(all_words):
-            rel_start = word_obj.start - offset
-            rel_end = word_obj.end - offset
-
-            if rel_end < 0 or rel_start > clip.duration:
-                continue
-
-            color = 'green' if i % 2 == 0 else 'red'
-            word_text = word_obj.word.strip()
-
-            try:
-                # v1/v2 compatibility handled by try/except usually, or explicity check
-                if MOVIEPY_V1:
-                    txt = TextClip(
-                        word_text, fontsize=fontsize, color=color, font=font,
-                        stroke_color='black', stroke_width=2
-                    ).set_position(('center', 0.8), relative=True).set_start(rel_start).set_duration(rel_end - rel_start)
-                else:
-                    txt = TextClip(
-                        text=word_text, font_size=fontsize, color=color, font=font,
-                        stroke_color='black', stroke_width=2
-                    ).with_position(('center', 0.8), relative=True).with_start(rel_start).with_duration(rel_end - rel_start)
-
-                text_clips.append(txt)
-            except:
-                continue
-
-        if text_clips:
-            # Composite
-            return CompositeVideoClip([clip] + text_clips)
-        return clip
+# --- 4. Professional Audio Engine ---
 
 class AudioEngine:
-    """Module 5: Audio Glue"""
-    def master(self, clip):
-        if not AUDIO_DSP_AVAILABLE or clip.audio is None: return clip
-
+    def master(self, clip, target_lufs=-14.0):
+        if clip.audio is None: return clip
         try:
+            st.write("🎧 AudioEngine: Mastering LUFS...")
             fs = 44100
-            arr = clip.audio.to_soundarray(fps=fs)
+            audio_arr = clip.audio.to_soundarray(fps=fs)
             meter = pyln.Meter(fs)
-            loudness = meter.integrated_loudness(arr)
-            # Target -14
-            gain = -14.0 - loudness
-            arr = arr * (10 ** (gain/20.0))
-            arr = np.clip(arr, -0.9, 0.9)
+            loudness = meter.integrated_loudness(audio_arr)
+            gain_db = target_lufs - loudness
+            gain_lin = 10 ** (gain_db / 20.0)
+            new_arr = audio_arr * gain_lin
+            limit = 10 ** (-1.0 / 20.0)
+            new_arr = np.clip(new_arr, -limit, limit)
+            new_audio = AudioArrayClip(new_arr, fps=fs)
 
             if MOVIEPY_V1:
-                from moviepy.audio.AudioClip import AudioArrayClip
-                return clip.set_audio(AudioArrayClip(arr, fps=fs))
+                return clip.set_audio(new_audio)
             else:
-                from moviepy.audio.AudioClip import AudioArrayClip
-                return clip.with_audio(AudioArrayClip(arr, fps=fs))
+                return clip.with_audio(new_audio)
         except:
             return clip
 
-class NeuralEditor:
-    def __init__(self, openai_key=None):
-        self.brain = ViralBrain(openai_key)
-        self.retention = RetentionEngine()
-        self.augmentor = ContentAugmentor()
-        self.audio = AudioEngine()
+    def add_ducking(self, clip, music_path):
+        if not music_path: return clip
+        try:
+            if MOVIEPY_V1:
+                music = AudioFileClip(music_path)
+                music = afx.audio_loop(music, duration=clip.duration)
+                music = music.fx(afx.volumex, 0.12)
+                comp = CompositeAudioClip([clip.audio, music])
+                return clip.set_audio(comp)
+            else:
+                music = AudioFileClip(music_path)
+                music = music.with_effects([
+                    afx.AudioLoop(duration=clip.duration),
+                    afx.MultiplyVolume(0.12)
+                ])
+                comp = CompositeAudioClip([clip.audio, music])
+                return clip.with_audio(comp)
+        except:
+            return clip
 
-    def process_video(self, video_path, viral_factor, attention_mode, assets_dir):
+    def apply_crossfade(self, clip, duration=0.05):
+        """Applies audio fade in/out to smoothing cuts."""
         if MOVIEPY_V1:
-            clip = VideoFileClip(video_path)
+            new_audio = clip.audio.fx(audio_fx.audio_fadein, duration).fx(audio_fx.audio_fadeout, duration)
+            return clip.set_audio(new_audio)
         else:
-            clip = VideoFileClip(video_path)
+            new_audio = clip.audio.with_effects([
+                afx.AudioFadeIn(duration),
+                afx.AudioFadeOut(duration)
+            ])
+            return clip.with_audio(new_audio)
 
-        # 1. Transcribe
-        temp_audio = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-        clip.audio.write_audiofile(temp_audio, logger=None)
-        segments = self.brain.transcribe_full(temp_audio)
-
-        # 2. Viral Selection
-        cuts = self.brain.analyze_viral_moments(segments, viral_factor)
+    def insert_transitions(self, clips, sfx_path=None):
+        """
+        Concatenates clips with transitions.
+        Inserts SFX at start of clips (except first).
+        """
+        sfx = None
+        if sfx_path and os.path.exists(sfx_path):
+            try:
+                sfx = AudioFileClip(sfx_path)
+            except:
+                pass
 
         final_clips = []
-        for start, end in cuts:
-            # Cut
-            if MOVIEPY_V1:
-                sub = clip.subclip(start, end)
-            else:
-                sub = clip.subclipped(start, end)
+        for i, clip in enumerate(clips):
+            # Apply Crossfade first
+            clip = self.apply_crossfade(clip)
 
-            # Retention Zoom
-            if attention_mode == "Gen-Z":
-                sub = self.retention.apply_punch_in(sub, attention_mode)
-            else:
-                sub = self.retention.apply_ken_burns(sub)
+            # Add SFX if not first
+            if i > 0 and sfx:
+                clip_audio = clip.audio
+                if MOVIEPY_V1:
+                    comp = CompositeAudioClip([clip_audio, sfx])
+                    comp = comp.set_duration(clip.duration)
+                    clip = clip.set_audio(comp)
+                else:
+                    comp = CompositeAudioClip([clip_audio, sfx])
+                    comp = comp.with_duration(clip.duration)
+                    clip = clip.with_audio(comp)
 
-            # Filter segments for this time range to pass to Augmentor
-            # We pass the full list and the offset (start) to handle relative timing
+            final_clips.append(clip)
 
-            # B-Roll
-            sub = self.augmentor.inject_b_roll(sub, segments, offset=start)
+        return concatenate_videoclips(final_clips)
 
-            # Karaoke
-            sub = self.augmentor.generate_karaoke_subs(sub, segments, offset=start)
 
-            final_clips.append(sub)
+# --- 5. Graphics & Color Engine ---
 
-        if not final_clips:
-            final_video = clip
-        else:
-            final_video = concatenate_videoclips(final_clips)
+class GraphicsEngine:
+    def apply_grade(self, clip, mode):
+        def vlog_filter(im):
+            im = im.astype(float)
+            gray = np.dot(im[...,:3], [0.299, 0.587, 0.114])
+            gray = gray[:,:,np.newaxis]
+            im = gray + (im - gray) * 1.3
+            return np.clip(im, 0, 255).astype(np.uint8)
 
-        # Master Audio
-        final_video = self.audio.master(final_video)
+        def cinematic_filter(im):
+            im = im.astype(float)
+            im = (im - 128) * 1.2 + 128
+            luma = np.dot(im[...,:3], [0.299, 0.587, 0.114])
+            highlights = luma > 150
+            shadows = luma < 100
+            im[highlights, 0] += 15
+            im[highlights, 1] += 5
+            im[highlights, 2] -= 10
+            im[shadows, 0] -= 10
+            im[shadows, 1] += 5
+            im[shadows, 2] += 15
+            return np.clip(im, 0, 255).astype(np.uint8)
 
-        os.unlink(temp_audio)
-        clip.close()
+        if mode == "Vlog Mode":
+            return clip.fl_image(vlog_filter) if MOVIEPY_V1 else clip.image_transform(vlog_filter)
+        elif mode == "Cinematic Mode":
+            return clip.fl_image(cinematic_filter) if MOVIEPY_V1 else clip.image_transform(cinematic_filter)
+        return clip
 
-        return final_video
+    def generate_karaoke(self, clip, segments, offset=0):
+        if not segments: return clip
+        st.write("🎨 GraphicsEngine: Animating Captions...")
+        w, h = clip.size
+        fontsize = int(h / 20)
+        font = "Impact" if os.name == 'nt' else "DejaVu-Sans-Bold"
+        text_clips = []
+        words = []
+        for s in segments:
+            if "words" in s:
+                words.extend(s["words"])
 
-# --- UI ---
-
-def main():
-    st.set_page_config(page_title="Jules Insane Mode", page_icon="🧠", layout="wide")
-    st.title("🧠 Jules Insane Mode: The Viral Engine")
-
-    with st.sidebar:
-        api_key = st.text_input("OpenAI API Key (Optional)", type="password")
-        viral_factor = st.slider("Viral Factor", 0.1, 1.0, 0.5)
-        attn_mode = st.radio("Attention Span", ["Gen-Z", "Millennial"])
-
-        st.divider()
-        st.write("Asset Manager (Upload 'money.mp4', etc)")
-        uploaded_assets = st.file_uploader("Upload B-Roll", accept_multiple_files=True)
-        if uploaded_assets:
-            os.makedirs("assets", exist_ok=True)
-            for f in uploaded_assets:
-                with open(os.path.join("assets", f.name), "wb") as w:
-                    w.write(f.read())
-            st.success(f"Loaded {len(uploaded_assets)} assets.")
-
-    video_file = st.file_uploader("Upload Raw Long-Form Video", type=["mp4"])
-
-    if video_file:
-        tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        tfile.write(video_file.read())
-
-        if st.button("Activate Neural Engine"):
-            editor = NeuralEditor(api_key)
-            status = st.status("Spinning up Neural Networks...", expanded=True)
+        for w_obj in words:
+            word = w_obj["word"].strip()
+            start = w_obj["start"] - offset
+            end = w_obj["end"] - offset
+            if start < 0 or start > clip.duration: continue
 
             try:
-                status.write("🧠 Reading Video Memory...")
-                output = editor.process_video(tfile.name, viral_factor, attn_mode, "assets")
+                # Optimized for retention: Single word pop-up
+                if MOVIEPY_V1:
+                    txt = TextClip(word, fontsize=fontsize, color='yellow', font=font,
+                        stroke_color='black', stroke_width=2, method='caption'
+                    ).set_position(('center', 0.8), relative=True).set_start(start).set_duration(end-start)
+                else:
+                    txt = TextClip(text=word, font_size=fontsize, color='yellow', font=font,
+                        stroke_color='black', stroke_width=2, method='caption'
+                    ).with_position(('center', 0.8), relative=True).with_start(start).with_duration(end-start)
+                text_clips.append(txt)
+            except: pass
+        if text_clips:
+            return CompositeVideoClip([clip] + text_clips)
+        return clip
 
-                status.write("💾 Rendering Viral Output...")
-                out_path = "insane_output.mp4"
-                output.write_videofile(out_path, codec="libx264", audio_codec="aac", logger=None)
+    def inject_b_roll(self, clip, segments, assets_dir, offset=0):
+        if not os.path.exists(assets_dir): return clip
+        words = []
+        for s in segments:
+            if "words" in s:
+                words.extend(s["words"])
 
-                status.update(label="✅ Viral Content Ready", state="complete", expanded=False)
-                st.video(out_path)
+        b_roll_clips = []
+        for w_obj in words:
+            word = w_obj["word"].lower().strip(".,!?")
+            asset_path = os.path.join(assets_dir, f"{word}.mp4")
+            start = w_obj["start"] - offset
+            if os.path.exists(asset_path) and 0 <= start < clip.duration:
+                try:
+                    b_roll = VideoFileClip(asset_path).resize(height=clip.h)
+                    b_roll = b_roll.set_position("center").set_start(start).set_duration(1.5)
+                    b_roll_clips.append(b_roll)
+                except: pass
 
-            except Exception as e:
-                st.error(f"Engine Failure: {e}")
-            finally:
-                os.unlink(tfile.name)
+        if b_roll_clips:
+            return CompositeVideoClip([clip] + b_roll_clips)
+        return clip
+
+
+# --- 6. Master Controller: JulesEngine ---
+
+class JulesEngine:
+    def __init__(self, output_dir="Jules_Output"):
+        self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        self.brain = ViralBrain(st.session_state.get("openai_key"))
+        self.vision = RetentionEngine()
+        self.audio = AudioEngine()
+        self.graphics = GraphicsEngine()
+
+    def process_video(self, input_path: str, mode: str, viral_factor: float,
+                      music_path: str = None, sfx_path: str = None,
+                      preview_mode: bool = False):
+
+        status = st.status(f"🚀 Processing: {os.path.basename(input_path)}", expanded=True)
+
+        try:
+            status.write("📂 Loading Media...")
+            if MOVIEPY_V1:
+                clip = VideoFileClip(input_path)
+            else:
+                clip = VideoFileClip(input_path)
+
+            if preview_mode:
+                clip = clip.subclip(0, min(10, clip.duration))
+
+            # Extract Audio & Transcribe
+            temp_audio = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+            clip.audio.write_audiofile(temp_audio, logger=None)
+
+            segments = self.brain.transcribe(temp_audio)
+
+            # Analyze / Cut (Viral or Fallback DSP)
+            if preview_mode:
+                cuts = [(0, clip.duration)]
+            else:
+                status.write("🧠 Analyzing Content...")
+                cuts = self.brain.analyze_virality(segments, temp_audio, clip.duration)
+
+            processed_clips = []
+
+            for i, (start, end) in enumerate(cuts):
+                status.write(f"🎞️ Editing Segment {i+1}...")
+
+                if MOVIEPY_V1:
+                    sub = clip.subclip(start, end)
+                else:
+                    sub = clip.subclipped(start, end)
+
+                # Visual Processing
+                if mode == "Viral Short (9:16)":
+                    sub = self.vision.smart_crop_9_16(sub)
+
+                # Random Logic: Punch-in OR Ken Burns
+                if random.choice([True, False]):
+                    sub = self.vision.apply_punch_ins(sub)
+                else:
+                    sub = self.vision.apply_dynamic_zoom(sub)
+
+                sub = self.graphics.inject_b_roll(sub, segments, "assets", offset=start)
+
+                grade_mode = st.session_state.get("grade_mode", "None")
+                if grade_mode != "None":
+                    sub = self.graphics.apply_grade(sub, grade_mode)
+
+                sub = self.graphics.generate_karaoke(sub, segments, offset=start)
+
+                processed_clips.append(sub)
+
+            # Concatenate with Transitions (Crossfade & SFX)
+            if not processed_clips:
+                final_video = clip
+            else:
+                final_video = self.audio.insert_transitions(processed_clips, sfx_path)
+
+            # Audio Glue
+            if music_path:
+                status.write("🎵 Applying Smart Ducking...")
+                final_video = self.audio.add_ducking(final_video, music_path)
+
+            status.write("🎚️ Mastering Audio...")
+            final_video = self.audio.master(final_video)
+
+            filename = f"jules_{int(time.time())}_{os.path.basename(input_path)}"
+            out_path = os.path.join(self.output_dir, filename)
+
+            status.write("💾 Rendering to Disk...")
+            final_video.write_videofile(out_path, codec="libx264", audio_codec="aac", logger=None, preset="medium", threads=4)
+
+            status.update(label="✅ Finished", state="complete", expanded=False)
+
+            os.unlink(temp_audio)
+            clip.close()
+            final_video.close()
+            return out_path
+
+        except Exception as e:
+            status.update(label="❌ Failed", state="error")
+            st.error(f"Error: {e}")
+            return None
+
+
+# --- 7. UI: Studio Mode ---
+
+def main():
+    st.set_page_config(page_title="Jules Studio", page_icon="🔥", layout="wide")
+    st.markdown("""<style>.stApp { background-color: #0E1117; color: #FFF; } div.stButton > button { background-color: #FF4B4B; color: white; border-radius: 6px; font-weight: bold; width: 100%; }</style>""", unsafe_allow_html=True)
+
+    st.sidebar.title("🔥 Jules Studio")
+    st.sidebar.caption("Autonomous AI Video Engine")
+
+    mode = st.sidebar.selectbox("Edit Mode", ["Viral Short (9:16)", "Cinematic (16:9)"])
+    viral_factor = st.sidebar.slider("Viral Aggressiveness", 0.1, 1.0, 0.5)
+    st.session_state["grade_mode"] = st.sidebar.selectbox("Color Grade", ["None", "Vlog Mode", "Cinematic Mode"])
+    st.session_state["openai_key"] = st.sidebar.text_input("OpenAI Key (Optional)", type="password")
+
+    st.sidebar.divider()
+    bg_music = st.sidebar.file_uploader("Background Music", type=["mp3"])
+    sfx_upload = st.sidebar.file_uploader("SFX (Whoosh)", type=["mp3"])
+
+    music_path = None
+    if bg_music:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
+            f.write(bg_music.read())
+            music_path = f.name
+
+    sfx_path = None
+    if sfx_upload:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
+            f.write(sfx_upload.read())
+            sfx_path = f.name
+
+    st.title("🎬 Production Dashboard")
+    root_input = st.text_input("Root Folder Path", ".")
+
+    if root_input and os.path.exists(root_input):
+        videos = []
+        for r, d, f in os.walk(root_input):
+            if "Jules_Output" in d: d.remove("Jules_Output")
+            for file in f:
+                if file.lower().endswith(('.mp4', '.mov', '.mkv')):
+                    videos.append(os.path.join(r, file))
+
+        st.write(f"Found {len(videos)} source files.")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("▶️ Generate 10s Preview"):
+                engine = JulesEngine()
+                if videos:
+                    out = engine.process_video(videos[0], mode, viral_factor, music_path, sfx_path, preview_mode=True)
+                    if out: st.video(out)
+
+        with col2:
+            if st.button("🚀 Render All (Production)"):
+                engine = JulesEngine()
+                progress = st.progress(0)
+                for i, v in enumerate(videos):
+                    engine.process_video(v, mode, viral_factor, music_path, sfx_path, preview_mode=False)
+                    progress.progress((i+1)/len(videos))
+                st.success("Batch Production Complete.")
 
 if __name__ == "__main__":
     main()
