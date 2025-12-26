@@ -5,9 +5,9 @@ import time
 import numpy as np
 import streamlit as st
 
-# --- robust imports ---
+# --- Robust MoviePy Imports (v1 vs v2) ---
 try:
-    # Try v1 first as requested
+    # Attempt MoviePy v1 (moviepy.editor)
     from moviepy.editor import (
         VideoFileClip, AudioFileClip, ImageClip, CompositeVideoClip,
         CompositeAudioClip, concatenate_videoclips, vfx, afx
@@ -15,7 +15,7 @@ try:
     import moviepy.audio.fx.all as audio_fx
     MOVIEPY_V1 = True
 except ImportError:
-    # Fallback to v2
+    # Fallback to MoviePy v2
     import moviepy
     from moviepy import (
         VideoFileClip, AudioFileClip, ImageClip, CompositeVideoClip,
@@ -23,7 +23,6 @@ except ImportError:
     )
     import moviepy.video.fx as vfx
     import moviepy.audio.fx as afx
-    # v2 usually doesn't have audio.fx.all, effects are in moviepy.audio.fx
     MOVIEPY_V1 = False
 
 class AIEditorEngine:
@@ -38,41 +37,34 @@ class AIEditorEngine:
         self.crossfade_duration = crossfade_duration
         self.music_vol = music_vol
 
-    def _get_max_volume(self, clip, chunk_size=0.1):
+    def _get_max_volume(self, clip):
         """Helper to check max volume of a clip/subclip efficiently."""
         if clip.audio is None:
             return 0
 
         try:
-            # v2 safety: check if fps is set, if not set it (often needed for AudioClip)
-            if not MOVIEPY_V1 and not hasattr(clip.audio, 'fps') or clip.audio.fps is None:
-                # Default to 44100 if not set, though subclipped usually inherits
+            # v2 safety: check if fps is set on audio, if not set it
+            if not MOVIEPY_V1 and (not hasattr(clip.audio, 'fps') or clip.audio.fps is None):
                 clip.audio.fps = 44100
 
             return clip.audio.max_volume()
         except Exception:
-            # Fallback: manually get a chunk
+            # Fallback: manually get a chunk (robustness)
             try:
-                # v2: get_frame at t=0? No, we need volume.
-                # v2 audio is usually an array generation.
-                # subclip duration is small (0.2s).
-                # to_soundarray() is robust
-                arr = clip.audio.to_soundarray(fps=44100)
-                if arr is None or arr.size == 0:
+                # Analyze a small chunk (0.1s) if max_volume fails
+                chunk = clip.audio.to_soundarray(nbytes=2, fps=44100)
+                if chunk is None or chunk.size == 0:
                     return 0
-                return np.max(np.abs(arr))
+                return np.max(np.abs(chunk))
             except:
                 return 0
 
     def cut_silence(self, video):
         """
         Analyzes audio and removes silent segments.
-        Returns a concatenated clip of 'loud' segments.
+        Returns a list of 'loud' subclips.
         """
         if video.audio is None:
-            # No audio, cannot detect silence. Return as is?
-            # Or return None? Requirement: "Skip it gracefully" if no loud segments.
-            # If no audio, technically no loud segments.
             return None
 
         # Analysis Window
@@ -82,7 +74,7 @@ class AIEditorEngine:
         loud_segments = []
         current_start = None
 
-        # Iterate
+        # Iterate through video audio
         while t < duration:
             t_end = min(t + window, duration)
             if MOVIEPY_V1:
@@ -111,11 +103,10 @@ class AIEditorEngine:
         if not valid_segments:
             return None
 
-        # Create clips
+        # Create buffered clips
         clips = []
         for start, end in valid_segments:
-            # Buffer? "keep a small buffer"
-            # Let's add 0.1s buffer if possible, clamped to duration
+            # Buffer: 0.1s padding if possible
             s_buf = max(0, start - 0.1)
             e_buf = min(duration, end + 0.1)
 
@@ -124,20 +115,16 @@ class AIEditorEngine:
             else:
                 clip = video.subclipped(s_buf, e_buf)
 
-            # Apply Crossfade (Audio)
-            # v1: clip.audio.fx(afx.audio_fadein, 0.05).fx(afx.audio_fadeout, 0.05)
-            # v2: clip.with_effects(...)
-
-            # We apply audio fade to avoid clicks
+            # Apply Audio Crossfades (Fade In/Out) to prevent clicks
             if MOVIEPY_V1:
-                # clip.audio is an AudioClip
-                # We need to set the audio back to the clip
+                # v1: clip.audio.fx... returns modified audio
+                # audio_fx.audio_fadein is the function
                 new_audio = clip.audio.fx(audio_fx.audio_fadein, self.crossfade_duration) \
                                       .fx(audio_fx.audio_fadeout, self.crossfade_duration)
                 clip = clip.set_audio(new_audio)
             else:
-                # v2
-                # Audio effects are in afx
+                # v2: with_effects([afx.AudioFadeIn(...)])
+                # Apply to audio directly
                 new_audio = clip.audio.with_effects([
                     afx.AudioFadeIn(self.crossfade_duration),
                     afx.AudioFadeOut(self.crossfade_duration)
@@ -150,10 +137,10 @@ class AIEditorEngine:
 
     def apply_color_grade(self, clip, mode):
         """
-        Applies color grading based on mode using NumPy.
+        Applies color grading based on mode using NumPy filters.
         """
         def filter_vlog(image):
-            # Saturation 1.3x, Contrast 1.1x
+            # Saturation 1.3x, Contrast 1.1x (Mild Pop)
             img = image.astype(float)
             # Contrast
             img = (img - 128.0) * 1.1 + 128.0
@@ -163,39 +150,29 @@ class AIEditorEngine:
             return np.clip(img, 0, 255).astype(np.uint8)
 
         def filter_cinematic(image):
-            # High Contrast 1.2x
-            # Teal/Orange: Boost Red in highlights, Blue/Cyan in shadows
+            # High Contrast 1.2x, Teal/Orange Tint
             img = image.astype(float)
 
             # Contrast
             img = (img - 128.0) * 1.2 + 128.0
 
-            # Simple Teal/Orange Tint
-            # Highlights (>150): +Red, -Blue
-            # Shadows (<100): -Red, +Blue, +Green
-
-            # This is expensive per pixel in python?
-            # Vectorized approach
-
-            # Luma
+            # Luma for Highlights/Shadows
             luma = np.dot(img[..., :3], [0.299, 0.587, 0.114])
 
-            # Masks
             highlights = luma > 150
             shadows = luma < 100
 
-            # Apply tints (subtle)
-            # Highlights: Add Orange (255, 160, 0) -> R+20, G+10
+            # Highlights: Add Orange/Gold (R+, G+)
             img[highlights, 0] += 15 # R
             img[highlights, 1] += 5  # G
             img[highlights, 2] -= 10 # B
 
-            # Shadows: Add Teal (0, 128, 128) -> R-10, G+5, B+15
+            # Shadows: Add Teal (R-, G+, B+)
             img[shadows, 0] -= 10 # R
             img[shadows, 1] += 5  # G
             img[shadows, 2] += 15 # B
 
-            # Desaturate slightly (0.8)
+            # Desaturate slightly (0.8x) for that "grim/clean" look
             gray = luma[..., np.newaxis]
             img = gray + (img - gray) * 0.8
 
@@ -210,30 +187,30 @@ class AIEditorEngine:
 
     def add_transitions(self, clips, sfx_path):
         """
-        Inserts SFX at cut points.
-        Returns concatenated clip.
+        Concatenates clips and inserts SFX at cut points.
         """
         # Load SFX
         sfx = None
         if sfx_path and os.path.exists(sfx_path):
-            if MOVIEPY_V1:
+            try:
                 sfx = AudioFileClip(sfx_path)
-            else:
-                sfx = AudioFileClip(sfx_path)
+            except:
+                pass
 
         final_clips = []
         for i, clip in enumerate(clips):
+            # Add SFX to start of clip (except the very first one)
             if i > 0 and sfx:
-                # Add SFX to start of clip
-                # Composite Audio
+                # Composite Audio: Original Audio + SFX
                 clip_audio = clip.audio
-                sfx_dur = sfx.duration
 
-                # Check if sfx is longer than clip?
-                # If sfx is 0.5s and clip is 1.0s, fine.
+                # Check durations. If SFX is longer than clip, we might need to trim or just let it mix?
+                # CompositeAudioClip duration is usually max of inputs.
+                # We want to preserve clip duration.
 
                 if MOVIEPY_V1:
                     comp = CompositeAudioClip([clip_audio, sfx])
+                    # Force duration to match video clip
                     comp = comp.set_duration(clip.duration)
                     clip = clip.set_audio(comp)
                 else:
@@ -247,62 +224,68 @@ class AIEditorEngine:
 
     def add_audio_ducking(self, video, music_path):
         """
-        Adds background music with ducking.
+        Adds background music looped at 12% volume.
         """
         if not music_path or not os.path.exists(music_path):
             return video
 
-        if MOVIEPY_V1:
+        try:
             bg_music = AudioFileClip(music_path)
-            # Loop
-            bg_music = afx.audio_loop(bg_music, duration=video.duration)
-            # Volume
-            bg_music = bg_music.fx(afx.volumex, self.music_vol)
 
-            # Composite
-            new_audio = CompositeAudioClip([video.audio, bg_music])
-            return video.set_audio(new_audio)
-        else:
-            bg_music = AudioFileClip(music_path)
-            # v2 loop: using afx.AudioLoop or similar?
-            # afx.AudioLoop(duration=...) effect?
-            # Or just wrap the audio object?
-            # v2: audio.with_effects([afx.AudioLoop(duration=...)])
-            bg_music = bg_music.with_effects([afx.AudioLoop(duration=video.duration)])
+            if MOVIEPY_V1:
+                # Loop and Volume
+                bg_music = afx.audio_loop(bg_music, duration=video.duration)
+                bg_music = bg_music.fx(afx.volumex, self.music_vol)
 
-            # Volume: afx.MultiplyVolume
-            bg_music = bg_music.with_effects([afx.MultiplyVolume(self.music_vol)])
+                new_audio = CompositeAudioClip([video.audio, bg_music])
+                return video.set_audio(new_audio)
+            else:
+                # v2
+                # Loop: afx.AudioLoop(duration=...)
+                bg_music = bg_music.with_effects([afx.AudioLoop(duration=video.duration)])
+                # Volume: afx.MultiplyVolume(factor)
+                bg_music = bg_music.with_effects([afx.MultiplyVolume(self.music_vol)])
 
-            new_audio = CompositeAudioClip([video.audio, bg_music])
-            return video.with_audio(new_audio)
+                new_audio = CompositeAudioClip([video.audio, bg_music])
+                return video.with_audio(new_audio)
+        except:
+            # If music fails, return original
+            return video
 
     def add_watermark(self, video, watermark_path):
         """
-        Overlays watermark.
+        Overlays resized, padded watermark at bottom-right.
         """
         if not watermark_path or not os.path.exists(watermark_path):
             return video
 
-        if MOVIEPY_V1:
-            wm = ImageClip(watermark_path)
-            # Resize - height 50px?
-            wm = wm.resize(height=video.h // 10) # 10% height
-            wm = wm.set_duration(video.duration)
-            # Position
-            wm = wm.set_position(("right", "bottom")).margin(right=20, bottom=20, opacity=0)
+        try:
+            if MOVIEPY_V1:
+                wm = ImageClip(watermark_path)
+                # Resize to 10% of video height
+                wm = wm.resize(height=int(video.h * 0.1))
+                wm = wm.set_duration(video.duration)
+                # Position: Bottom-Right with padding (margin)
+                # margin creates a transparent wrapper
+                wm = wm.margin(right=20, bottom=20, opacity=0)
+                wm = wm.set_position(("right", "bottom"))
 
-            return CompositeVideoClip([video, wm])
-        else:
-            wm = ImageClip(watermark_path)
-            # v2: resized -> resized(height=...) method? or with_effects([vfx.Resize(...)])
-            # ImageClip in v2 usually has resized method if imported from moviepy?
-            # Check v2 docs in mind: clip.resized(height=...)
-            wm = wm.resized(height=video.h // 10)
-            wm = wm.with_duration(video.duration)
-            # Position: with_position
-            wm = wm.with_position(("right", "bottom")).with_effects([vfx.Margin(right=20, bottom=20, opacity=0)])
+                return CompositeVideoClip([video, wm])
+            else:
+                wm = ImageClip(watermark_path)
+                # v2: use resized() or with_effects([vfx.Resize(...)])
+                # Check dir(vfx), 'Resize' is a class.
+                wm = wm.with_effects([vfx.Resize(height=int(video.h * 0.1))])
+                wm = wm.with_duration(video.duration)
 
-            return CompositeVideoClip([video, wm])
+                # Position & Margin
+                # v2 Margin effect
+                wm = wm.with_effects([vfx.Margin(right=20, bottom=20, opacity=0)])
+                wm = wm.with_position(("right", "bottom"))
+
+                return CompositeVideoClip([video, wm])
+        except:
+            return video
 
 # --- Streamlit UI ---
 
@@ -310,60 +293,70 @@ def main():
     st.set_page_config(
         page_title="Jules Pro Editor",
         page_icon="🎬",
-        layout="wide",
-        initial_sidebar_state="expanded"
+        layout="wide"
     )
 
-    # Custom CSS
+    # Custom "Studio" CSS
     st.markdown("""
     <style>
         .stApp {
-            background-color: #0e1117;
-            color: #ffffff;
+            background-color: #0E1117;
+            color: #FAFAFA;
         }
-        .stButton>button {
-            background-color: #ff4b4b;
-            color: white;
-            border-radius: 5px;
-            font-weight: bold;
-        }
+        /* Tabs styling */
         .stTabs [data-baseweb="tab-list"] {
-            gap: 20px;
+            gap: 10px;
         }
         .stTabs [data-baseweb="tab"] {
-            height: 50px;
-            white-space: pre-wrap;
             background-color: #262730;
-            border-radius: 5px;
-            padding-top: 10px;
-            padding-bottom: 10px;
-            color: white;
+            border-radius: 4px;
+            color: #FAFAFA;
+            padding: 10px 20px;
         }
         .stTabs [aria-selected="true"] {
-            background-color: #ff4b4b;
+            background-color: #FF4B4B;
+            color: white;
+        }
+        /* Button styling */
+        div.stButton > button {
+            background-color: #FF4B4B;
+            color: white;
+            border: none;
+            padding: 10px 24px;
+            font-size: 16px;
+            border-radius: 8px;
+            font-weight: 600;
+        }
+        div.stButton > button:hover {
+            background-color: #FF2B2B;
         }
     </style>
     """, unsafe_allow_html=True)
 
     st.title("🎬 Jules Pro Video Editor")
-    st.caption("Automated High-End Post-Production Engine")
+    st.caption("Autonomous High-End Post-Production Engine")
 
+    # Layout: Tabs
     tab_dash, tab_settings = st.tabs(["🎛️ Dashboard", "⚙️ Settings"])
 
     with tab_settings:
         st.header("Engine Configuration")
         col1, col2 = st.columns(2)
         with col1:
-            threshold = st.slider("Silence Threshold", 0.01, 0.1, 0.03, 0.005)
-            min_dur = st.slider("Min Clip Duration (s)", 0.5, 2.0, 1.0)
+            threshold = st.slider("Silence Threshold", 0.01, 0.1, 0.03, 0.005,
+                                  help="Volume level below which audio is considered silence.")
+            min_dur = st.slider("Min Clip Duration (s)", 0.5, 3.0, 1.0,
+                                help="Shortest allowed clip length.")
         with col2:
-            music_vol = st.slider("Music Volume Ducking", 0.05, 0.5, 0.12)
-            crossfade = st.slider("Crossfade Duration", 0.0, 0.2, 0.05)
+            music_vol = st.slider("Background Music Volume", 0.05, 0.5, 0.12,
+                                  help="Ducking level for background track (12% default).")
+            crossfade = st.slider("Crossfade Duration (s)", 0.0, 0.5, 0.05,
+                                  help="Audio fade in/out at cuts.")
 
-        st.subheader("Branding & Assets")
+        st.subheader("Asset Paths")
         watermark_path = st.text_input("Watermark Image Path (.png)", "")
         bg_music_path = st.text_input("Background Music Path (.mp3)", "")
-        sfx_path = st.text_input("Whoosh SFX Path (.mp3)", "whoosh.mp3")
+        sfx_path = st.text_input("Transition SFX Path (.mp3)", "whoosh.mp3")
 
     with tab_dash:
         st.header("Batch Processing")
@@ -373,7 +366,7 @@ def main():
 
         if st.button("🚀 Start Production"):
             if not os.path.exists(root_path):
-                st.error("Root path does not exist.")
+                st.error(f"Root path not found: {root_path}")
             else:
                 # Initialize Engine
                 engine = AIEditorEngine(
@@ -383,68 +376,76 @@ def main():
                     music_vol=music_vol
                 )
 
-                # Scan
+                # Scan for videos
                 videos = []
                 out_dir_name = "Jules_Pro_Output"
 
+                st.write(f"Scanning `{root_path}`...")
                 for r, d, f in os.walk(root_path):
+                    # Robust ignore of output folder
                     if out_dir_name in d:
                         d.remove(out_dir_name)
+
                     for file in f:
                         if file.lower().endswith(('.mp4', '.mov', '.mkv')):
                             videos.append(os.path.join(r, file))
 
                 if not videos:
-                    st.warning("No videos found.")
+                    st.warning("No video files found.")
                 else:
                     output_root = os.path.join(root_path, out_dir_name)
                     os.makedirs(output_root, exist_ok=True)
 
-                    progress = st.progress(0)
+                    progress_bar = st.progress(0)
 
                     for i, v_path in enumerate(videos):
                         fname = os.path.basename(v_path)
 
-                        # Status container
-                        with st.status(f"Processing: {fname}", expanded=True) as status:
+                        # Real-time Status Log
+                        with st.status(f"Processing: **{fname}**", expanded=True) as status:
                             try:
-                                status.write("🔍 Analyzing Audio & Cutting Silence...")
+                                status.write("🔍 Analyzing Audio & Smart-Cutting Silence...")
                                 video = VideoFileClip(v_path)
 
+                                # 1. Smart Cut
                                 clips = engine.cut_silence(video)
                                 if not clips:
-                                    status.write("⚠️ Skipped: No loud segments found.")
+                                    status.write("⚠️ Skipped: No loud segments found (or file error).")
+                                    status.update(label=f"⚠️ Skipped: {fname}", state="error")
                                     video.close()
                                     continue
 
-                                status.write("✂️ Assembling Cuts & Transitions...")
+                                # 2. Transitions
+                                status.write("✂️ Assembling Clips & Adding Transitions...")
                                 processed_clip = engine.add_transitions(clips, sfx_path)
 
-                                # Close raw clips? subclips refer to original video, so keep video open
-
+                                # 3. Color Grading
                                 if color_mode != "None":
-                                    status.write(f"🎨 Applying {color_mode}...")
+                                    status.write(f"🎨 Applying Color Grade: {color_mode}...")
                                     processed_clip = engine.apply_color_grade(processed_clip, color_mode)
 
-                                status.write("🎵 Engineering Audio (Ducking & Fades)...")
+                                # 4. Audio Ducking
+                                status.write("🎵 Engineering Audio Layers (Ducking & Fades)...")
                                 processed_clip = engine.add_audio_ducking(processed_clip, bg_music_path)
 
+                                # 5. Watermark
                                 if watermark_path:
-                                    status.write("©️ Applying Watermark...")
+                                    status.write("©️ Overlaying Watermark...")
                                     processed_clip = engine.add_watermark(processed_clip, watermark_path)
 
-                                # Output Path
+                                # Output
                                 rel_path = os.path.relpath(v_path, root_path)
                                 out_path = os.path.join(output_root, rel_path)
                                 os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-                                status.write("💾 Rendering Final Cut...")
-                                # Write
+                                status.write("💾 Rendering Final Master...")
                                 processed_clip.write_videofile(
                                     out_path,
                                     codec="libx264",
                                     audio_codec="aac",
                                     fps=24,
+                                    preset="medium",
+                                    threads=4,
                                     logger=None
                                 )
 
@@ -452,16 +453,17 @@ def main():
                                 processed_clip.close()
                                 video.close()
 
-                                status.update(label=f"✅ Finished: {fname}", state="complete", expanded=False)
+                                status.update(label=f"✅ Completed: {fname}", state="complete", expanded=False)
 
                             except Exception as e:
-                                status.write(f"❌ Error: {str(e)}")
+                                st.error(f"Error processing {fname}: {str(e)}")
                                 status.update(label=f"❌ Failed: {fname}", state="error")
                                 if 'video' in locals(): video.close()
 
-                        progress.progress((i + 1) / len(videos))
+                        progress_bar.progress((i + 1) / len(videos))
 
-                    st.success("All videos processed successfully!")
+                    st.balloons()
+                    st.success("✨ All videos processed successfully!")
 
 if __name__ == "__main__":
     main()
