@@ -1,0 +1,10 @@
+moviepy
+opencv-python
+mediapipe
+numpy
+scipy
+librosa
+pyloudnorm
+faster-whisper
+streamlit
+psutil
