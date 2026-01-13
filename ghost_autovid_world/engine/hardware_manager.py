@@ -46,11 +46,13 @@ class HardwareManager:
 
         try:
             # Run ffmpeg -encoders
+            # Adding check=True to raise exception on failure
             result = subprocess.run(
                 [ffmpeg_bin, "-encoders"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                check=True
             )
             output = result.stdout
 
