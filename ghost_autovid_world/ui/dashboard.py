@@ -40,6 +40,16 @@ def render_dashboard():
         st.metric("CPU Cores", status["cpu_cores"])
         st.metric("RAM Free (GB)", status["memory_free_gb"])
         st.progress(status["memory_free_gb"] / status["memory_total_gb"])
+
+        st.divider()
+        st.header("GPU ACCELERATION")
+        if status["gpu_vendor"] != "CPU":
+            st.success(f"ACTIVE: {status['gpu_vendor']}")
+            st.caption(f"Encoder: {status['encoder']}")
+        else:
+            st.warning("ACTIVE: CPU ONLY")
+            st.caption("No supported GPU found")
+
         st.divider()
         st.write("ENGINE: READY")
 

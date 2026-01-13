@@ -3,6 +3,7 @@ import os
 import numpy as np
 import pyloudnorm as pyln
 from moviepy.audio.AudioClip import AudioArrayClip
+from ghost_autovid_world.engine.hardware_manager import HardwareManager
 
 class AudioEngine:
     def process_file(self, input_path, output_path, target_lufs=-14.0):
@@ -26,8 +27,15 @@ class AudioEngine:
 
             # Write output
             if is_video:
-                # Use threads=1 for safety if not specified, or just default
-                processed_clip.write_videofile(output_path, codec="libx264", audio_codec="aac")
+                hw = HardwareManager()
+                render_settings = hw.get_render_settings()
+                processed_clip.write_videofile(
+                    output_path,
+                    codec=render_settings["codec"],
+                    audio_codec="aac",
+                    threads=render_settings["threads"],
+                    preset=render_settings["preset"]
+                )
             else:
                 processed_clip.write_audiofile(output_path)
 

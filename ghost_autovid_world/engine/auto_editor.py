@@ -147,12 +147,14 @@ class AutoEditor:
 
             from ghost_autovid_world.engine.hardware_manager import HardwareManager
             hw = HardwareManager()
+            render_settings = hw.get_render_settings()
 
             final.write_videofile(
                 output_path,
-                codec="libx264",
+                codec=render_settings["codec"],
                 audio_codec="aac",
-                threads=hw.ffmpeg_threads,
+                threads=render_settings["threads"],
+                preset=render_settings["preset"],
                 logger=None
             )
 
