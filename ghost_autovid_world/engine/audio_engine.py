@@ -1,9 +1,44 @@
 
+import os
 import numpy as np
 import pyloudnorm as pyln
 from moviepy.audio.AudioClip import AudioArrayClip
 
 class AudioEngine:
+    def process_file(self, input_path, output_path, target_lufs=-14.0):
+        try:
+            # Safe import
+            try:
+                from moviepy.editor import VideoFileClip, AudioFileClip
+            except ImportError:
+                from moviepy import VideoFileClip, AudioFileClip
+
+            # Check if video or audio
+            ext = os.path.splitext(input_path)[1].lower()
+            is_video = ext in ['.mp4', '.mov', '.avi', '.mkv']
+
+            if is_video:
+                clip = VideoFileClip(input_path)
+            else:
+                clip = AudioFileClip(input_path)
+
+            processed_clip = self.process(clip, target_lufs=target_lufs)
+
+            # Write output
+            if is_video:
+                # Use threads=1 for safety if not specified, or just default
+                processed_clip.write_videofile(output_path, codec="libx264", audio_codec="aac")
+            else:
+                processed_clip.write_audiofile(output_path)
+
+            clip.close()
+            if processed_clip != clip:
+                processed_clip.close()
+            return True
+        except Exception as e:
+            print(f"Audio Process File Error: {e}")
+            return False
+
     def process(self, clip, target_lufs=-14.0):
         if clip.audio is None: return clip
 

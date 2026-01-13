@@ -37,7 +37,7 @@ class AutoEditor:
 
         return np.mean(xs), np.mean(ys)
 
-    def process(self, main_meta, b_roll_metas, output_path, status_callback=None):
+    def process(self, main_meta, b_roll_metas, output_path, status_callback=None, silence_threshold=0.05, zoom_factor=1.2, b_roll_interval=3):
         """
         Core pipeline: Silence Removal -> Smart Zoom -> B-Roll -> Mastering.
         """
@@ -67,7 +67,7 @@ class AutoEditor:
                 arr_pad = np.pad(arr, (0, pad))
                 rms = np.sqrt(np.mean(arr_pad.reshape(-1, w)**2, axis=1))
 
-                threshold = np.max(rms) * 0.05
+                threshold = np.max(rms) * silence_threshold
                 active = np.convolve(rms > threshold, [1,1,1], 'same') > 0
 
                 fps_w = 22050/w
@@ -104,7 +104,7 @@ class AutoEditor:
                 # Apply crop if face found (not center)
                 if cx != 0.5 or cy != 0.5:
                     w, h = sub.size
-                    zoom_factor = 1.2 # 120% zoom
+                    # zoom_factor is now dynamic
                     new_w = w / zoom_factor
                     new_h = h / zoom_factor
 
@@ -119,7 +119,7 @@ class AutoEditor:
                     sub = sub.crop(x1=x1, y1=y1, width=new_w, height=new_h).resize((w, h))
 
                 # B-Roll Logic
-                if i > 0 and i % 3 == 0 and b_roll_pool:
+                if i > 0 and i % b_roll_interval == 0 and b_roll_pool:
                     br = b_roll_pool[i % len(b_roll_pool)]
                     if br.duration < sub.duration:
                         try:

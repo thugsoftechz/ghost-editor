@@ -5,36 +5,43 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 class ThumbnailEngine:
-    def generate(self, video_path, output_path, title_text):
+    def generate(self, video_path, output_path, title_text, time_pos=None):
         """
         Extracts best frame and adds text.
         """
         try:
             cap = cv2.VideoCapture(video_path)
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-            # Simple heuristic: Middle of video often good
-            # Better: Analyze brightness/contrast
-
             best_frame = None
-            max_score = -1
 
-            # Check 10 candidate frames
-            for i in range(10):
-                fid = int(frame_count * (0.1 + 0.8 * (i/10)))
-                cap.set(cv2.CAP_PROP_POS_FRAMES, fid)
+            if time_pos is not None:
+                # Manual timestamp
+                # time_pos is in seconds
+                cap.set(cv2.CAP_PROP_POS_MSEC, time_pos * 1000)
                 ret, frame = cap.read()
-                if not ret: continue
-
-                # Score: Brightness + Variance (Sharpness/Detail)
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                brightness = np.mean(gray)
-                sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
-
-                score = brightness + (sharpness * 0.5)
-                if score > max_score:
-                    max_score = score
+                if ret:
                     best_frame = frame
+            else:
+                # Heuristic search
+                frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+                max_score = -1
+
+                # Check 10 candidate frames
+                for i in range(10):
+                    fid = int(frame_count * (0.1 + 0.8 * (i/10)))
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, fid)
+                    ret, frame = cap.read()
+                    if not ret: continue
+
+                    # Score: Brightness + Variance (Sharpness/Detail)
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    brightness = np.mean(gray)
+                    sharpness = cv2.Laplacian(gray, cv2.CV_64F).var()
+
+                    score = brightness + (sharpness * 0.5)
+                    if score > max_score:
+                        max_score = score
+                        best_frame = frame
 
             cap.release()
 
